@@ -1,60 +1,136 @@
 `default_nettype none
 
-module Transmitter #(
-    parameter DATA_WIDTH = 4
-    ) (
-    input logic clk,
-    input logic reset_n,
-    input logic start, // pulse to start transmission
-    input logic signed [DATA_WIDTH-1:0] data_in, // parallel signed data
-    output logic serial_out
+// -----------------------------------------------------------------------------
+// UART_Transmitter : serial transmitter, LSB first.
+//
+//     start      : pulse for 1 clk while busy == 0 to send data_in.
+//                  Ignored while busy == 1. (If you hold it high, the byte is
+//                  sent again as soon as the previous frame ends - use a pulse.)
+//     data_in    : latched on the clk edge where start is accepted, so it only
+//                  has to be valid in that one cycle.
+//     serial_out : the TX line. Registered (glitch free), idles high.
+//     busy       : high from the cycle after start is accepted until the end
+//                  of the stop bit.
+//     done       : 1-clk pulse in the first cycle after the stop bit finished
+//                  (the same cycle busy falls).
+// -----------------------------------------------------------------------------
+module UART_Transmitter #(
+    parameter int CLK_FREQ_HZ = 50_000_000,
+    parameter int BAUD_RATE   = 115_200,
+    parameter int DATA_WIDTH  = 8
+) (
+    input  logic                  clk,
+    input  logic                  reset_n,   // async reset, active low
+    input  logic                  start,
+    input  logic [DATA_WIDTH-1:0] data_in,
+    output logic                  serial_out,
+    output logic                  busy,
+    output logic                  done
 );
 
-    typedef enum logic [2:0] {
-        IDLE,
-        START,
-        BIT0,
-        BIT1,
-        BIT2,
-        BIT3,
-        STOP
+    // CLKS_PER_BIT should be greater or equal to 2
+    localparam int CLKS_PER_BIT = (CLK_FREQ_HZ + BAUD_RATE / 2) / BAUD_RATE;
+
+    localparam int CNT_W        = $clog2(CLKS_PER_BIT + 1);
+    localparam int IDX_W        = $clog2(DATA_WIDTH + 1);
+
+    localparam logic [CNT_W-1:0] CNT_MAX  = CNT_W'(CLKS_PER_BIT - 1);
+    localparam logic [IDX_W-1:0] LAST_IDX = IDX_W'(DATA_WIDTH - 1);
+
+    typedef enum logic [1:0] {
+        IDLE,    // line high, waiting for start
+        START,   // start bit (line low) for 1 bit time
+        DATA,    // all data bits, one after another
+        STOP     // stop bit (line high) for 1 bit time
     } state_t;
 
     state_t state, next_state;
 
+    logic [CNT_W-1:0]      clk_cnt;
+    logic [IDX_W-1:0]      bit_idx;
+    logic [DATA_WIDTH-1:0] shift_reg;
+    logic [DATA_WIDTH-1:0] shift_next;
+    logic                  tx_q;
+    logic                  bit_tick;
+
+    assign bit_tick   = (clk_cnt == CNT_MAX);
+    assign shift_next = shift_reg >> 1;
+
+    // ---------------------------------------------------------------- FSM ----
     always_ff @(posedge clk or negedge reset_n) begin // Sequential block
-        if (!reset_n) begin
-            state <= IDLE;
-        end
-        else begin
-            state <= next_state;
-        end
+        if (!reset_n) state <= IDLE;
+        else          state <= next_state;
     end
 
     always_comb begin // Combinational next-state block
+        next_state = state;                    //> default: stay where we are
         case (state)
-            IDLE: next_state = start? START : IDLE;
-            START: next_state = BIT0;
-            BIT0: next_state = BIT1;
-            BIT1: next_state = BIT2;
-            BIT2: next_state = BIT3;
-            BIT3: next_state = STOP;
-            STOP: next_state = IDLE;
-            default: next_state = IDLE;
+            IDLE:    if (start)                           next_state = START;
+            START:   if (bit_tick)                        next_state = DATA;
+            DATA:    if (bit_tick && bit_idx == LAST_IDX) next_state = STOP;
+            STOP:    if (bit_tick)                        next_state = IDLE;
+            default:                                      next_state = IDLE;
         endcase
     end
 
     always_comb begin // Combinational output block
-        case (state)
-            IDLE: serial_out = 1'b1;
-            START: serial_out = 1'b0;
-            BIT0: serial_out = data_in[0];
-            BIT1: serial_out = data_in[1];
-            BIT2: serial_out = data_in[2];
-            BIT3: serial_out = data_in[3];
-            STOP: serial_out = 1'b1;
-            default: serial_out = 1'b1;
-        endcase
+        busy = (state != IDLE);
     end
 
+    // ----------------------------------------------------------- datapath ----
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            clk_cnt   <= '0;
+            bit_idx   <= '0;
+            shift_reg <= '0;
+            tx_q      <= 1'b1;
+            done      <= 1'b0;
+        end
+        else begin
+            done <= 1'b0;
+
+            if (state == IDLE || bit_tick) clk_cnt <= '0;
+            else                           clk_cnt <= clk_cnt + 1'b1;
+
+            // tx_q changes on the same clock edge as the state, so the wire
+            // and the FSM always agree on which bit we are in.
+            case (state)
+                IDLE: begin
+                    bit_idx <= '0;
+                    if (start) begin
+                        shift_reg <= data_in;
+                        tx_q      <= 1'b0;
+                    end
+                end
+
+                START: begin
+                    if (bit_tick) tx_q <= shift_reg[0];
+                end
+
+                DATA: begin
+                    if (bit_tick) begin
+                        if (bit_idx == LAST_IDX) begin
+                            tx_q <= 1'b1;
+                        end
+                        else begin
+                            shift_reg <= shift_next;
+                            tx_q      <= shift_next[0];
+                            bit_idx   <= bit_idx + 1'b1;
+                        end
+                    end
+                end
+
+                STOP: begin
+                    if (bit_tick) done <= 1'b1;
+                end
+
+                default: ;
+            endcase
+        end
+    end
+
+    assign serial_out = tx_q;
+
 endmodule
+
+`default_nettype wire
